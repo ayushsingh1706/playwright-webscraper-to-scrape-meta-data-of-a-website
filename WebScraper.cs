@@ -60,411 +60,489 @@ public class FailedUrl
 
 public class ScraperOptions
 {
-    public int    Workers                { get; set; } = 5;
-    public int    MaxPages               { get; set; } = 0;
-    public int    DelayBetweenRequestsMs { get; set; } = 200;
-    public float  PageTimeoutMs          { get; set; } = 20_000;
-    public bool   SkipErrorPages         { get; set; } = true;
-    public int    SaveProgressEvery      { get; set; } = 20;
-    public string OutputFile             { get; set; } = "scrape_result.json";
-    public string UserAgent              { get; set; } =
+    public int    Workers       { get; set; } = 3;
+    public int    MaxPages      { get; set; } = 0;
+    public int    DelayMs       { get; set; } = 1000;
+    public int    PageTimeoutMs { get; set; } = 30_000;
+    public int    HardTimeoutMs { get; set; } = 40_000;
+    public int    NetworkIdleMs { get; set; } = 5_000;
+    public int    SaveEvery     { get; set; } = 10;
+    public string OutputFile    { get; set; } = "scrape_result.json";
+    public string UserAgent     { get; set; } =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 }
 
 public class WebScraper
 {
-    private readonly ScraperOptions _options;
+    private readonly ScraperOptions _opt;
+    private Uri      _base     = null!;
+    private string   _startUrl = "";
+    private DateTime _t0;
 
-    // Thread-safe shared state
-    private readonly ConcurrentDictionary<string, byte> _visited = new(StringComparer.OrdinalIgnoreCase);
-    private readonly BlockingCollection<string>         _urlChannel;
-    private readonly ConcurrentBag<PageMetadata>        _pages   = new();
-    private readonly ConcurrentBag<FailedUrl>           _failed  = new();
+    private readonly ConcurrentDictionary<string, byte> _seen  = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentBag<PageMetadata>        _pages = new();
+    private readonly ConcurrentBag<FailedUrl>           _fails = new();
+    private readonly ConcurrentQueue<string>            _queue = new();
+    private int                                         _idle  = 0;
+    private readonly SemaphoreSlim                      _sig   = new(0, int.MaxValue);
+    private volatile bool                               _done  = false;
 
-    private Uri      _baseUri   = null!;
-    private string   _startUrl  = "";
-    private DateTime _startedAt;
-    private int      _pageCount = 0;
-    private int      _activeWorkers = 0;
-
-    public WebScraper(ScraperOptions? options = null)
+    private static readonly HashSet<string> BadExts = new(StringComparer.OrdinalIgnoreCase)
     {
-        _options    = options ?? new ScraperOptions();
-        _urlChannel = new BlockingCollection<string>(boundedCapacity: 50_000);
-    }
+        ".png",".jpg",".jpeg",".gif",".webp",".svg",".ico",".bmp",
+        ".css",".js",".mjs",".ts",".map",
+        ".woff",".woff2",".ttf",".eot",".otf",
+        ".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",
+        ".zip",".rar",".tar",".gz",".7z",
+        ".mp4",".mp3",".avi",".mov",".wmv",".webm",".ogg",".wav",
+        ".json",".xml",".rss",".atom",".txt",".csv"
+    };
 
-    public async Task<string> ScrapeWebsiteAsync(string startUrl)
+    private static readonly string[] BadPaths =
     {
-        if (!startUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-            startUrl = "https://" + startUrl;
+        "/wp-json/","/wp-admin/","/wp-login","/wp-cron",
+        "/api/","/graphql","/rest/v","/__data","/.well-known/",
+        "/cdn-cgi/","/etc.clientlibs/","/content/dam/",
+        "/feed/","/rss","/sitemap",
+        "/login","/logout","/signin","/signout",
+        "/register","/signup","/auth/","/oauth/",
+        "/system/","/saml","/cart","/checkout",
+        "/search?","/print/","/embed/",
+        "/404","/500","/error"
+    };
 
-        _startUrl  = startUrl;
-        _baseUri   = new Uri(startUrl);
-        _startedAt = DateTime.UtcNow;
+    public WebScraper(ScraperOptions? opt = null) => _opt = opt ?? new ScraperOptions();
 
-        Console.WriteLine("[Scraper] Verifying Chromium...");
+    public async Task<string> ScrapeAsync(string startUrl)
+    {
+        if (!startUrl.StartsWith("http")) startUrl = "https://" + startUrl;
+        _startUrl = startUrl;
+        _base     = new Uri(startUrl);
+        _t0       = DateTime.UtcNow;
+
+        Console.WriteLine("[*] Checking Chromium...");
         Microsoft.Playwright.Program.Main(new[] { "install", "chromium" });
-        Console.WriteLine("[Scraper] Chromium ready.\n");
+        Console.WriteLine("[*] Chromium OK\n");
+        Console.WriteLine($"  URL      : {startUrl}");
+        Console.WriteLine($"  Workers  : {_opt.Workers}");
+        Console.WriteLine($"  MaxPages : {(_opt.MaxPages == 0 ? "unlimited" : _opt.MaxPages.ToString())}");
+        Console.WriteLine($"  Delay    : {_opt.DelayMs}ms\n");
 
-        // Seed the first URL
-        _visited.TryAdd(NormaliseUrl(startUrl), 0);
-        _urlChannel.Add(NormaliseUrl(startUrl));
+        var seed = Clean(startUrl);
+        _seen.TryAdd(seed, 0);
+        Push(seed);
 
-        var playwright = await Playwright.CreateAsync();
-        var browser    = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+        var pw      = await Playwright.CreateAsync();
+        var browser = await pw.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
         {
             Headless = true,
-            Args = new[] {
-                "--no-sandbox", "--disable-setuid-sandbox",
+            Args     = new[]
+            {
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage"
+                "--disable-dev-shm-usage",
+                "--disable-infobars",
+                "--window-size=1920,1080"
             }
         });
 
-        Console.WriteLine($"[Scraper] Starting {_options.Workers} parallel workers...");
-        Console.WriteLine($"[Scraper] MaxPages = {(_options.MaxPages == 0 ? "UNLIMITED" : _options.MaxPages.ToString())}\n");
-
-        // Start all workers simultaneously
-        _activeWorkers = _options.Workers;
-        var workerTasks = Enumerable.Range(1, _options.Workers)
-            .Select(id => Task.Run(() => RunWorkerAsync(browser, id)))
-            .ToList();
-
-        // Auto-save in background
-        using var cts      = new CancellationTokenSource();
-        var       saveTask = AutoSaveAsync(cts.Token);
-
-        await Task.WhenAll(workerTasks);
-        cts.Cancel();
-        try { await saveTask; } catch { }
+        var tasks = Enumerable.Range(1, _opt.Workers)
+                              .Select(id => WorkerAsync(browser, id))
+                              .ToArray();
+        await Task.WhenAll(tasks);
 
         await browser.CloseAsync();
-        playwright.Dispose();
+        pw.Dispose();
 
-        var json = BuildJson();
-        await File.WriteAllTextAsync(_options.OutputFile, json);
-        Console.WriteLine($"\n[Scraper] DONE — {_pages.Count} pages, {_failed.Count} failures.");
-        Console.WriteLine($"[Scraper] Saved: {_options.OutputFile}");
+        var json = Serialize();
+        await File.WriteAllTextAsync(_opt.OutputFile, json);
+        Console.WriteLine($"\n[✓] DONE — {_pages.Count} pages, {_fails.Count} failed");
+        Console.WriteLine($"[✓] Saved → {_opt.OutputFile}");
         return json;
     }
 
-    private async Task RunWorkerAsync(IBrowser browser, int workerId)
+    private async Task WorkerAsync(IBrowser browser, int id)
     {
-        // Each worker gets its own browser context
-        var context = await browser.NewContextAsync(new BrowserNewContextOptions
+        var ctx = await MakeCtxAsync(browser);
+        Console.WriteLine($"[W{id}] Ready");
+
+        while (true)
         {
-            UserAgent         = _options.UserAgent,
+            if (_opt.MaxPages > 0 && _pages.Count >= _opt.MaxPages) break;
+            if (_done) break;
+
+            if (!_queue.TryDequeue(out var url))
+            {
+                int idle = Interlocked.Increment(ref _idle);
+                if (idle == _opt.Workers && _queue.IsEmpty)
+                {
+                    _done = true;
+                    _sig.Release(_opt.Workers);
+                    Interlocked.Decrement(ref _idle);
+                    break;
+                }
+                await _sig.WaitAsync(10_000);
+                Interlocked.Decrement(ref _idle);
+                if (_done) break;
+                if (!_queue.TryDequeue(out url)) continue;
+            }
+
+            Console.WriteLine($"[W{id}] [{_pages.Count + _fails.Count + 1}] {url}  (queue:{_queue.Count})");
+
+            PageMetadata? meta = null;
+            try
+            {
+                using var cts = new CancellationTokenSource(_opt.HardTimeoutMs);
+                meta = await ScrapePage(ctx, url).WaitAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine($"[W{id}] [!] Timeout — {url}");
+                _fails.Add(new() { Url = url, Reason = "Timeout" });
+                try { await ctx.CloseAsync(); } catch { }
+                ctx = await MakeCtxAsync(browser);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[W{id}] [!] {ex.Message}");
+                _fails.Add(new() { Url = url, Reason = ex.Message });
+            }
+
+            if (meta != null)
+            {
+                // Update base host if site redirected (e.g. bare → www)
+                if (_pages.IsEmpty)
+                {
+                    try
+                    {
+                        var h = new Uri(meta.Url).Host;
+                        if (!h.Equals(_base.Host, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _base = new Uri(meta.Url);
+                            Console.WriteLine($"[*] Base host updated to: {h}");
+                        }
+                    }
+                    catch { }
+                }
+
+                _pages.Add(meta);
+
+                int added = 0;
+                foreach (var link in meta.Links.Where(l => l.Type == "internal"))
+                {
+                    var c = Clean(link.Href);
+                    if (IsGood(c) && _seen.TryAdd(c, 0))
+                    {
+                        Push(c);
+                        added++;
+                    }
+                }
+
+                Console.WriteLine($"[W{id}]   \"{Trunc(meta.Title, 55)}\"");
+                Console.WriteLine(
+                    $"[W{id}]   {meta.Links.Count(l => l.Type == "internal")} internal, " +
+                    $"{meta.Links.Count(l => l.Type == "external")} external | " +
+                    $"{added} new queued | queue: {_queue.Count}");
+
+                if (_pages.Count % _opt.SaveEvery == 0) await SaveNow();
+            }
+
+            if (_opt.DelayMs > 0) await Task.Delay(_opt.DelayMs);
+        }
+
+        await ctx.CloseAsync();
+        Console.WriteLine($"[W{id}] Done");
+    }
+
+    private void Push(string url) { _queue.Enqueue(url); _sig.Release(); }
+
+    private async Task<PageMetadata?> ScrapePage(IBrowserContext ctx, string url)
+    {
+        var page = await ctx.NewPageAsync();
+        var sw   = System.Diagnostics.Stopwatch.StartNew();
+        int code = 0;
+
+        try
+        {
+            page.Response += (_, r) =>
+            { try { if (r.Url.TrimEnd('/') == url.TrimEnd('/')) code = r.Status; } catch { } };
+
+            try
+            {
+                var r = await page.GotoAsync(url, new PageGotoOptions
+                    { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = _opt.PageTimeoutMs });
+                if (r != null) code = r.Status;
+            }
+            catch (TimeoutException)
+            {
+                Console.WriteLine($"  [~] Timeout loading {url}, using partial content");
+            }
+            catch { }
+
+            try { await page.WaitForLoadStateAsync(LoadState.NetworkIdle,
+                new() { Timeout = _opt.NetworkIdleMs }); }
+            catch { }
+
+            sw.Stop();
+            if (code == 0) code = 200;
+
+            // Log the actual status code for debugging
+            if (code >= 400)
+            {
+                Console.WriteLine($"  [!] HTTP {code} for {url}");
+                _fails.Add(new() { Url = url, Reason = $"HTTP {code}" });
+                return null;
+            }
+
+            // Check if page was blocked by bot protection
+            var pageTitle = "";
+            try { pageTitle = await page.TitleAsync(); } catch { }
+
+            if (pageTitle.Contains("Just a moment", StringComparison.OrdinalIgnoreCase) ||
+                pageTitle.Contains("Attention Required", StringComparison.OrdinalIgnoreCase) ||
+                pageTitle.Contains("Access denied", StringComparison.OrdinalIgnoreCase) ||
+                pageTitle.Contains("DDoS protection", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"  [!] Bot protection detected on {url} — waiting 3s and retrying");
+                await Task.Delay(3000);
+
+                // Try once more after waiting
+                try
+                {
+                    await page.ReloadAsync(new PageReloadOptions
+                        { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = _opt.PageTimeoutMs });
+                    pageTitle = await page.TitleAsync();
+                }
+                catch { }
+
+                if (pageTitle.Contains("Just a moment", StringComparison.OrdinalIgnoreCase))
+                {
+                    _fails.Add(new() { Url = url, Reason = "Bot protection (Cloudflare)" });
+                    return null;
+                }
+            }
+
+            var m = new PageMetadata
+            {
+                Url        = url,
+                StatusCode = code,
+                ScrapedAt  = DateTime.UtcNow.ToString("o"),
+                LoadTimeMs = sw.ElapsedMilliseconds,
+                Title      = pageTitle
+            };
+
+            try
+            {
+                var d = await page.EvaluateAsync<Dictionary<string, string>>(@"() => {
+                    const q=(a,v)=>{const e=document.querySelector('meta['+a+'=""'+v+'""]');return e?(e.getAttribute('content')||''):'';};
+                    const can=document.querySelector('link[rel=""canonical""]');
+                    return {
+                        desc:   q('name','description')        || q('property','description'),
+                        kw:     q('name','keywords'),
+                        author: q('name','author')             || q('property','article:author'),
+                        robots: q('name','robots'),
+                        vp:     q('name','viewport'),
+                        ogt:    q('property','og:title')       || q('name','og:title'),
+                        ogd:    q('property','og:description') || q('name','og:description'),
+                        ogi:    q('property','og:image')       || q('name','og:image'),
+                        cs:     document.characterSet          || '',
+                        canon:  can ? can.href : ''
+                    };
+                }");
+                if (d != null)
+                {
+                    m.Description   = d.GetValueOrDefault("desc",   "");
+                    m.Keywords      = d.GetValueOrDefault("kw",     "");
+                    m.Author        = d.GetValueOrDefault("author", "");
+                    m.Robots        = d.GetValueOrDefault("robots", "");
+                    m.Viewport      = d.GetValueOrDefault("vp",     "");
+                    m.OgTitle       = d.GetValueOrDefault("ogt",    "");
+                    m.OgDescription = d.GetValueOrDefault("ogd",    "");
+                    m.OgImage       = d.GetValueOrDefault("ogi",    "");
+                    m.Charset       = d.GetValueOrDefault("cs",     "");
+                    m.Canonical     = d.GetValueOrDefault("canon",  "");
+                }
+            }
+            catch { }
+
+            try { m.H1Tags = await page.EvaluateAsync<List<string>>(
+                "()=>[...document.querySelectorAll('h1')].map(h=>h.innerText.trim()).filter(Boolean)") ?? new(); }
+            catch { }
+
+            try { m.H2Tags = await page.EvaluateAsync<List<string>>(
+                "()=>[...document.querySelectorAll('h2')].map(h=>h.innerText.trim()).filter(Boolean)") ?? new(); }
+            catch { }
+
+            var raw = new List<LinkInfo>();
+            try
+            {
+                var js = await page.EvaluateAsync<List<Dictionary<string, string>>>(@"
+                    () => [...document.querySelectorAll('a[href]')].map(a => ({
+                        href: a.href || '',
+                        text: (a.innerText || a.textContent || '').trim().substring(0, 150)
+                    })).filter(l => l.href && !l.href.startsWith('javascript'))
+                ");
+                foreach (var item in js ?? new())
+                {
+                    if (!item.TryGetValue("href", out var h) || string.IsNullOrWhiteSpace(h)) continue;
+                    var t = Cls(h);
+                    raw.Add(new() { Href = t == "internal" ? Clean(h) : h,
+                                    Text = item.GetValueOrDefault("text", ""), Type = t });
+                }
+            }
+            catch { }
+
+            try
+            {
+                var html = await page.ContentAsync();
+                foreach (Match mx in Regex.Matches(html,
+                    @"href\s*=\s*[""']([^""'#][^""']{1,200})[""']", RegexOptions.IgnoreCase))
+                {
+                    var h = mx.Groups[1].Value.Trim();
+                    if (string.IsNullOrWhiteSpace(h)) continue;
+                    string abs;
+                    try { abs = new Uri(new Uri(url), h).ToString(); } catch { continue; }
+                    var t = Cls(abs);
+                    raw.Add(new() { Href = t == "internal" ? Clean(abs) : abs, Text = "", Type = t });
+                }
+            }
+            catch { }
+
+            m.Links = raw
+                .GroupBy(l => l.Href, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.OrderByDescending(l => l.Text.Length).First())
+                .ToList();
+
+            try { m.Images = await page.EvaluateAsync<List<ImageInfo>>(
+                "()=>[...document.querySelectorAll('img')].map(i=>({src:i.src||'',alt:i.alt||''}))") ?? new(); }
+            catch { }
+
+            return m;
+        }
+        finally { try { await page.CloseAsync(); } catch { } }
+    }
+
+    private async Task<IBrowserContext> MakeCtxAsync(IBrowser browser)
+    {
+        var ctx = await browser.NewContextAsync(new BrowserNewContextOptions
+        {
+            UserAgent         = _opt.UserAgent,
             IgnoreHTTPSErrors = true,
-            ViewportSize      = new ViewportSize { Width = 1280, Height = 800 },
+            ViewportSize      = new ViewportSize { Width = 1920, Height = 1080 },
+            // Realistic browser headers to avoid bot detection
             ExtraHTTPHeaders  = new Dictionary<string, string>
             {
                 ["Accept-Language"] = "en-US,en;q=0.9",
-                ["Accept"]          = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                ["Accept"]          = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                ["Accept-Encoding"] = "gzip, deflate, br",
+                ["Cache-Control"]   = "max-age=0",
+                ["Sec-Fetch-Dest"]  = "document",
+                ["Sec-Fetch-Mode"]  = "navigate",
+                ["Sec-Fetch-Site"]  = "none",
+                ["Sec-Fetch-User"]  = "?1",
+                ["Upgrade-Insecure-Requests"] = "1"
             }
         });
 
-        await context.AddInitScriptAsync(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})");
+        // Full anti-detection script
+        await ctx.AddInitScriptAsync(@"
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+            window.chrome = { runtime: {} };
+        ");
 
-        // Block images, fonts, stylesheets — not needed for metadata
-        await context.RouteAsync("**/*", async route =>
+        // Only block media — keep images/CSS so pages render properly
+        // (some sites detect bot by checking if CSS loaded)
+        await ctx.RouteAsync("**/*", async route =>
         {
             var t = route.Request.ResourceType;
-            if (t is "image" or "media" or "font" or "stylesheet")
+            if (t is "media" or "font")
                 await route.AbortAsync();
             else
                 await route.ContinueAsync();
         });
 
-        Console.WriteLine($"[W{workerId}] Worker started");
-
-        try
-        {
-            // Keep taking URLs until channel is complete
-            foreach (var url in _urlChannel.GetConsumingEnumerable())
-            {
-                if (_options.MaxPages > 0 && _pageCount >= _options.MaxPages)
-                    break;
-
-                var count = Interlocked.Increment(ref _pageCount);
-                Console.WriteLine($"[W{workerId}] [{count}] {url}  (queue:{_urlChannel.Count})");
-
-                var meta = await ScrapePageAsync(context, url);
-                if (meta != null)
-                {
-                    _pages.Add(meta);
-
-                    // Enqueue new internal links — webpages only
-                    int newLinks = 0;
-                    foreach (var link in meta.Links.Where(l => l.Type == "internal"))
-                    {
-                        var n = NormaliseUrl(link.Href);
-                        n = DeduplicateRegionalUrl(n);
-                        if (!IsScrapableUrl(n)) continue;
-                        if (_visited.TryAdd(n, 0))
-                        {
-                            if (_options.MaxPages == 0 || _pageCount < _options.MaxPages)
-                            {
-                                _urlChannel.TryAdd(n);
-                                newLinks++;
-                            }
-                        }
-                    }
-                    if (newLinks > 0)
-                        Console.WriteLine($"[W{workerId}]   +{newLinks} links added");
-                }
-
-                if (_options.DelayBetweenRequestsMs > 0)
-                    await Task.Delay(_options.DelayBetweenRequestsMs);
-            }
-        }
-        finally
-        {
-            await context.CloseAsync();
-            Console.WriteLine($"[W{workerId}] Worker done");
-
-            // Last worker closes the channel so others stop
-            if (Interlocked.Decrement(ref _activeWorkers) == 0)
-                _urlChannel.CompleteAdding();
-        }
+        return ctx;
     }
 
-    private async Task<PageMetadata?> ScrapePageAsync(IBrowserContext context, string url)
-    {
-        IPage? page = null;
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        int statusCode = 0;
-
-        try
-        {
-            page = await context.NewPageAsync();
-            page.Response += (_, r) =>
-            {
-                try { if (r.Url.TrimEnd('/') == url.TrimEnd('/')) statusCode = r.Status; } catch { }
-            };
-
-            try
-            {
-                var r = await page.GotoAsync(url, new PageGotoOptions
-                    { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = _options.PageTimeoutMs });
-                if (r != null) statusCode = r.Status;
-            }
-            catch (TimeoutException) { }
-
-            try { await page.WaitForLoadStateAsync(LoadState.NetworkIdle, new() { Timeout = 6000 }); } catch { }
-
-            sw.Stop();
-            if (statusCode == 0) statusCode = 200;
-
-            if (_options.SkipErrorPages && statusCode >= 400)
-            {
-                _failed.Add(new() { Url = url, Reason = $"HTTP {statusCode}" });
-                return null;
-            }
-
-            var meta = new PageMetadata
-            {
-                Url = url, StatusCode = statusCode,
-                ScrapedAt = DateTime.UtcNow.ToString("o"), LoadTimeMs = sw.ElapsedMilliseconds
-            };
-
-            try { meta.Title = await page.TitleAsync(); } catch { }
-
-            // All meta in one JS call — tries every possible meta tag format
-            try
-            {
-                var m = await page.EvaluateAsync<Dictionary<string, string>>(@"() => {
-                    const g = (a,v) => {
-                        const e = document.querySelector('meta['+a+'=""'+v+'""]')
-                               || document.querySelector('meta['+a+""='""+v+""'""]');
-                        return e ? (e.getAttribute('content') || '') : '';
-                    };
-                    const c   = document.querySelector('link[rel=""canonical""]');
-                    const ogD = g('property','og:description') || g('name','og:description');
-                    const ogT = g('property','og:title')       || g('name','og:title');
-                    const ogI = g('property','og:image')       || g('name','og:image');
-
-                    // Fallback: grab first <p> text if no description meta found
-                    const desc = g('name','description')
-                              || g('property','description')
-                              || '';
-
-                    return {
-                        description:    desc,
-                        keywords:       g('name','keywords'),
-                        author:         g('name','author'),
-                        robots:         g('name','robots'),
-                        viewport:       g('name','viewport'),
-                        og_title:       ogT,
-                        og_description: ogD,
-                        og_image:       ogI,
-                        charset:        document.characterSet || document.charset || '',
-                        canonical:      c ? c.href : window.location.href
-                    };
-                }");
-                if (m != null)
-                {
-                    meta.Description   = m.GetValueOrDefault("description","");
-                    meta.Keywords      = m.GetValueOrDefault("keywords","");
-                    meta.Author        = m.GetValueOrDefault("author","");
-                    meta.Robots        = m.GetValueOrDefault("robots","");
-                    meta.Viewport      = m.GetValueOrDefault("viewport","");
-                    meta.OgTitle       = m.GetValueOrDefault("og_title","");
-                    meta.OgDescription = m.GetValueOrDefault("og_description","");
-                    meta.OgImage       = m.GetValueOrDefault("og_image","");
-                    meta.Charset       = m.GetValueOrDefault("charset","");
-                    meta.Canonical     = m.GetValueOrDefault("canonical","");
-                }
-            }
-            catch { }
-
-            try { meta.H1Tags = await page.EvaluateAsync<List<string>>("()=>[...document.querySelectorAll('h1')].map(h=>h.innerText.trim()).filter(Boolean)") ?? new(); } catch { }
-            try { meta.H2Tags = await page.EvaluateAsync<List<string>>("()=>[...document.querySelectorAll('h2')].map(h=>h.innerText.trim()).filter(Boolean)") ?? new(); } catch { }
-
-            // Links
-            var allLinks = new List<LinkInfo>();
-            try
-            {
-                var jsLinks = await page.EvaluateAsync<List<Dictionary<string, string>>>(
-                    @"()=>[...document.querySelectorAll('a[href]')].map(a=>({
-                        href:a.href||'',
-                        text:(a.innerText||'').trim().substring(0,150)
-                    })).filter(l=>l.href&&!l.href.startsWith('javascript'))");
-                foreach (var raw in jsLinks ?? new())
-                {
-                    if (!raw.TryGetValue("href", out var href) || string.IsNullOrWhiteSpace(href)) continue;
-                    var t = ClassifyLink(href);
-                    allLinks.Add(new() { Href = t=="internal"?NormaliseUrl(href):href, Text=raw.GetValueOrDefault("text",""), Type=t });
-                }
-            }
-            catch { }
-
-            // Regex fallback
-            try
-            {
-                var html = await page.ContentAsync();
-                foreach (Match match in Regex.Matches(html, @"href\s*=\s*[""']([^""'#][^""']{2,200})[""']", RegexOptions.IgnoreCase))
-                {
-                    var raw = match.Groups[1].Value.Trim();
-                    if (string.IsNullOrWhiteSpace(raw)) continue;
-                    string abs; try { abs = new Uri(new Uri(url), raw).ToString(); } catch { continue; }
-                    var t = ClassifyLink(abs);
-                    allLinks.Add(new() { Href = t=="internal"?NormaliseUrl(abs):abs, Text="", Type=t });
-                }
-            }
-            catch { }
-
-            meta.Links = allLinks
-                .GroupBy(l => l.Href, StringComparer.OrdinalIgnoreCase)
-                .Select(g => g.OrderByDescending(l => l.Text.Length).First())
-                .ToList();
-
-            try { meta.Images = await page.EvaluateAsync<List<ImageInfo>>("()=>[...document.querySelectorAll('img')].map(i=>({src:i.src||'',alt:i.alt||''}))") ?? new(); } catch { }
-
-            return meta;
-        }
-        catch (Exception ex)
-        {
-            sw.Stop();
-            Console.WriteLine($"       ERROR: {ex.Message}");
-            _failed.Add(new() { Url = url, Reason = ex.Message });
-            return null;
-        }
-        finally { if (page != null) try { await page.CloseAsync(); } catch { } }
-    }
-
-    private async Task AutoSaveAsync(CancellationToken ct)
-    {
-        int lastSaved = 0;
-        while (!ct.IsCancellationRequested)
-        {
-            await Task.Delay(5000).ContinueWith(_ => { });
-            var current = _pages.Count;
-            if (current >= lastSaved + _options.SaveProgressEvery)
-            {
-                await File.WriteAllTextAsync(_options.OutputFile, BuildJson());
-                lastSaved = current;
-                Console.WriteLine($"\n  ✅ Progress saved — {current} pages\n");
-            }
-        }
-    }
-
-    private string BuildJson() => JsonSerializer.Serialize(new ScrapeResult
-    {
-        BaseUrl = _startUrl, TotalPagesScraped = _pages.Count,
-        ScrapeStartedAt = _startedAt.ToString("o"), ScrapeFinishedAt = DateTime.UtcNow.ToString("o"),
-        Pages = _pages.ToList(), FailedUrls = _failed.ToList()
-    }, new JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull });
-
-    // ── Only queue actual webpages — skip files ──────────────────────
-    private string DeduplicateRegionalUrl(string url)
+    private async Task SaveNow()
     {
         try
         {
-            var uri  = new Uri(url);
-            var path = uri.AbsolutePath;
-            var regionalPrefixes = new[] { "/in/", "/mena/", "/ap/", "/uk/", "/ca/", "/au/" };
-            foreach (var prefix in regionalPrefixes)
-            {
-                if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                {
-                    var canonical = path.Substring(prefix.Length - 1);
-                    return $"{uri.Scheme}://{uri.Host}{canonical}";
-                }
-            }
+            await File.WriteAllTextAsync(_opt.OutputFile, Serialize());
+            Console.WriteLine($"\n  [✓] Saved {_pages.Count} pages → {_opt.OutputFile}\n");
         }
-        catch { }
-        return url;
+        catch (Exception ex) { Console.WriteLine($"  [!] Save error: {ex.Message}"); }
     }
 
-    private static bool IsScrapableUrl(string url)
+    private string Serialize() => JsonSerializer.Serialize(new ScrapeResult
     {
-        if (string.IsNullOrWhiteSpace(url)) return false;
+        BaseUrl           = _startUrl,
+        TotalPagesScraped = _pages.Count,
+        ScrapeStartedAt   = _t0.ToString("o"),
+        ScrapeFinishedAt  = DateTime.UtcNow.ToString("o"),
+        Pages             = _pages.OrderBy(p => p.Url).ToList(),
+        FailedUrls        = _fails.ToList()
+    }, new JsonSerializerOptions
+    {
+        WriteIndented          = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    });
 
-        // Skip non-webpage file extensions
-        var skipExtensions = new[]
-        {
-            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
-            ".css", ".js", ".json", ".xml",
-            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-            ".zip", ".rar", ".tar", ".gz",
-            ".mp4", ".mp3", ".avi", ".mov", ".wmv",
-            ".woff", ".woff2", ".ttf", ".eot", ".otf",
-            ".map", ".min.css", ".min.js"
-        };
-
-        try
-        {
-            var path = new Uri(url).AbsolutePath.ToLower();
-            foreach (var ext in skipExtensions)
-                if (path.EndsWith(ext)) return false;
-
-            // Skip clientlib/static asset paths common in AEM sites
-            if (path.Contains("/etc.clientlibs/")) return false;
-            if (path.Contains("/content/dam/") && !path.EndsWith("/")) return false;
-            if (path.Contains("/system/")) return false;
-            if (path.Contains("/logout"))  return false;
-            if (path.Contains("/login"))   return false;
-            if (path.Contains("/saml_"))   return false;
-        }
-        catch { return false; }
-
-        return true;
+    private static string Clean(string url)
+    {
+        try { return new Uri(url).GetLeftPart(UriPartial.Path).TrimEnd('/'); }
+        catch { return url; }
     }
 
-    private string ClassifyLink(string href)
+    private string Cls(string href)
     {
         if (string.IsNullOrWhiteSpace(href)) return "other";
-        if (href.StartsWith("#")) return "anchor";
-        if (href.StartsWith("mailto:") || href.StartsWith("tel:") || href.StartsWith("javascript:")) return "other";
-        try { return new Uri(href, UriKind.Absolute).Host.Equals(_baseUri.Host, StringComparison.OrdinalIgnoreCase) ? "internal" : "external"; }
+        if (href.StartsWith("#"))            return "anchor";
+        if (href.StartsWith("mailto:") || href.StartsWith("tel:") || href.StartsWith("javascript:"))
+            return "other";
+        try
+        {
+            var h        = new Uri(href, UriKind.Absolute).Host;
+            var baseHost = _base.Host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+                           ? _base.Host[4..] : _base.Host;
+            var linkHost = h.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+                           ? h[4..] : h;
+            return linkHost.Equals(baseHost, StringComparison.OrdinalIgnoreCase)
+                   ? "internal" : "external";
+        }
         catch { return "other"; }
     }
 
-    private string NormaliseUrl(string href)
+    private static bool IsGood(string url)
     {
-        try { return new Uri(href).GetLeftPart(UriPartial.Query).TrimEnd('/'); }
-        catch { return href; }
+        if (string.IsNullOrWhiteSpace(url)) return false;
+        if (url.Length > 200)               return false;
+        if (url.Contains("%20"))            return false;
+        if (url.Contains("%2F%2F"))         return false;
+        if (url.Contains("?"))
+        {
+            var q = url[(url.IndexOf('?'))..].ToLowerInvariant();
+            if (new[]{"rel=","modalname=","promo","discount","offer","utm_",
+                       "fbclid","gclid","_ga=","lp_","showcookies","date=","showtime"}
+                .Any(b => q.Contains(b))) return false;
+        }
+        try
+        {
+            var uri  = new Uri(url);
+            var path = uri.AbsolutePath.ToLowerInvariant();
+            var ext  = Path.GetExtension(path);
+            if (!string.IsNullOrEmpty(ext) && BadExts.Contains(ext)) return false;
+            foreach (var bad in BadPaths)
+                if (path.Contains(bad, StringComparison.OrdinalIgnoreCase)) return false;
+        }
+        catch { return false; }
+        return true;
     }
-}
 
+    private static string Trunc(string s, int max)
+        => s.Length <= max ? s : s[..max] + "…";
+}
